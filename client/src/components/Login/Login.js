@@ -96,6 +96,7 @@ export class Login extends Component {
 			autoLoginAttempted: false,
 			error: '',
 			networks,
+			authEnabled: false,
 			isLoading: false
 		};
 	}
@@ -107,7 +108,8 @@ export class Login extends Component {
 			network: {
 				error: null,
 				value: networks[0].name || ''
-			}
+			},
+			authEnabled: networks[0].authEnabled
 		}));
 	}
 
@@ -115,10 +117,37 @@ export class Login extends Component {
 		const { target } = event;
 		const value = target.type === 'checkbox' ? target.checked : target.value;
 		const { name } = target;
-		this.setState({
+
+		const newState = {
 			[name]: { value }
-		});
+		};
+		if (name === 'network') {
+			const { networks } = this.state;
+			newState.authEnabled = (networks.find(n => n.name === value) || {}).authEnabled;
+		}
+
+		this.setState(newState);
 	};
+
+	async performLogin({ user, password, network}) {
+		const { login } = this.props;
+		const { authEnabled } = this.state;
+
+		const info = await login(
+			{
+				user: authEnabled ? user : 'dummy-user',
+				password: authEnabled ? password : 'dummy-password',
+			},
+			network
+		);
+
+		this.setState(() => ({ info }));
+		if (info.status === 'Success') {
+			const { history } = this.props;
+			history.replace('/');
+			return true;
+		}
+	}
 
 	submitForm = async e => {
 		e.preventDefault();
@@ -132,25 +161,6 @@ export class Login extends Component {
 		});
 	};
 
-	async performLogin({ user, password, network}) {
-		const { login } = this.props;
-
-		const info = await login(
-			{
-				user,
-				password,
-			},
-			network
-		);
-
-		this.setState(() => ({ info }));
-		if (info.status === 'Success') {
-			const { history } = this.props;
-			history.replace('/');
-			return true;
-		}
-	}
-
 	async componentDidUpdate() {
 		const { networks, autoLoginAttempted } = this.state;
 
@@ -160,15 +170,13 @@ export class Login extends Component {
 			this.setState(() => ({
 				autoLoginAttempted: true
 			}));
-			await this.performLogin({ user: 'user', password: 'password', network: networks[0].name })
+			await this.performLogin({ network: networks[0].name })
 		}
 	}
 
 	render() {
-		const { info, user, password, network, networks, isLoading } = this.state;
+		const { info, user, password, network, networks, authEnabled, isLoading } = this.state;
 		const { classes, error } = this.props;
-
-		const authEnabled = (networks.find(({ name }) => name === network.value) || {}).authEnabled;
 
 		return (
 			<div className={classes.container}>
