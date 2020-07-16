@@ -2,11 +2,15 @@
  *SPDX-License-Identifier: Apache-2.0
  */
 
+const { Wallets, Gateway } = require('fabric-network');
 const {
-	FileSystemWallet,
-	Gateway,
-	X509WalletMixin
-} = require('fabric-network');
+	Discoverer,
+	DiscoveryService,
+	Client,
+	BlockDecoder
+} = require('fabric-common');
+const fabprotos = require('fabric-protos');
+const concat = require('lodash/concat');
 
 const FabricCAServices = require('fabric-ca-client');
 
@@ -24,15 +28,9 @@ class FabricGateway {
 		this.networkConfig = networkConfig;
 		this.config = null;
 		this.gateway = null;
-		this.userName = null;
-		this.enrollmentSecret = null;
-		this.identityLabel = null;
-		this.mspId = null;
 		this.wallet = null;
 		this.tlsEnable = false;
 		this.defaultChannelName = null;
-		this.defaultPeer = null;
-		this.defaultPeerUrl = null;
 		this.gateway = new Gateway();
 		this.fabricConfig = new FabricConfig();
 		this.fabricCaEnabled = false;
@@ -40,6 +38,7 @@ class FabricGateway {
 		this.client = null;
 		this.FSWALLET = null;
 		this.enableAuthentication = false;
+		this.asLocalhost = false;
 	}
 
 	async initialize() {
@@ -49,123 +48,104 @@ class FabricGateway {
 		this.config = this.fabricConfig.getConfig();
 		this.fabricCaEnabled = this.fabricConfig.isFabricCaEnabled();
 		this.tlsEnable = this.fabricConfig.getTls();
-		this.userName = this.fabricConfig.getAdminUser();
-		this.enrollmentSecret = this.fabricConfig.getAdminPassword();
 		this.enableAuthentication = this.fabricConfig.getEnableAuthentication();
 		this.networkName = this.fabricConfig.getNetworkName();
-		this.identityLabel = this.userName;
 		this.FSWALLET = 'wallet/' + this.networkName;
+
+		const explorerAdminId = this.fabricConfig.getAdminUser();
+		if (!explorerAdminId) {
+			logger.error('Failed to get admin ID from configuration file');
+			throw new ExplorerError(explorer_mess.error.ERROR_1010);
+		}
 
 		const info = `Loading configuration  ${this.config}`;
 		logger.debug(info.toUpperCase());
 
-		const peers = this.fabricConfig.getPeers();
-		this.defaultPeer = peers[0].name;
-		this.defaultPeerUrl = peers[0].url;
-		let orgMsp = [];
-		let signedCertPath;
-		let adminPrivateKeyPath;
-		logger.log('========== > defaultPeer ', this.defaultPeer);
-		/* eslint-disable */
-		({
-			orgMsp,
-			adminPrivateKeyPath,
-			signedCertPath
-		} = this.fabricConfig.getOrganizationsConfig());
-		logger.log(
-			'signedCertPath ',
-			signedCertPath,
-			' \nadminPrivateKeyPath ',
-			adminPrivateKeyPath
-		);
-
 		this.defaultChannelName = this.fabricConfig.getDefaultChannel();
-		this.mspId = orgMsp[0];
-		let caURL = [];
-		let serverCertPath = null;
-		({ caURL, serverCertPath } = this.fabricConfig.getCertificateAuthorities());
-		/* eslint-enable */
 		let identity;
-		let enrollment;
-
 		try {
 			// Create a new file system based wallet for managing identities.
 			const walletPath = path.join(process.cwd(), this.FSWALLET);
-			this.wallet = new FileSystemWallet(walletPath);
+			this.wallet = await Wallets.newFileSystemWallet(walletPath);
 			// Check to see if we've already enrolled the admin user.
-			const adminExists = await this.wallet.exists(this.userName);
-			if (adminExists) {
+			identity = await this.wallet.get(explorerAdminId);
+			if (identity) {
 				logger.debug(
-					`An identity for the admin user: ${
-						this.userName
-					} already exists in the wallet`
+					`An identity for the admin user: ${explorerAdminId} already exists in the wallet`
 				);
-				await this.wallet.export(this.userName);
-			} else if (!adminExists) {
-				if (this.fabricCaEnabled) {
-					({ enrollment, identity } = await this._enrollCaIdentity(
-						caURL,
-						enrollment,
-						identity
-					));
+			} else if (this.fabricCaEnabled) {
+				logger.info('CA enabled');
+
+				identity = await this.enrollCaIdentity(
+					explorerAdminId,
+					this.fabricConfig.getAdminPassword()
+				);
+			} else {
+				/*
+				 * Identity credentials to be stored in the wallet
+				 * Look for signedCert in first-network-connection.json
+				 */
+
+				const signedCertPem = this.fabricConfig.getOrgSignedCertPem();
+				const adminPrivateKeyPem = this.fabricConfig.getOrgAdminPrivateKeyPem();
+				identity = this.enrollUserIdentity(
+					explorerAdminId,
+					signedCertPem,
+					adminPrivateKeyPem
+				);
+			}
+
+			if (!this.tlsEnable) {
+				Client.setConfigSetting('discovery-protocol', 'grpc');
+			} else {
+				Client.setConfigSetting('discovery-protocol', 'grpcs');
+			}
+
+			// Set connection options; identity and wallet
+			this.asLocalhost =
+				String(Client.getConfigSetting('discovery-as-localhost', 'true')) ===
+				'true';
+
+			const connectionOptions = {
+				identity: explorerAdminId,
+				wallet: this.wallet,
+				discovery: {
+					enabled: true,
+					asLocalhost: this.asLocalhost
+				}
+			};
+
+			if ('clientTlsIdentity' in this.config.client) {
+				logger.info('client TLS enabled');
+				const mTlsIdLabel = this.config.client.clientTlsIdentity;
+				const mTlsId = await this.wallet.get(mTlsIdLabel);
+				if (mTlsId !== undefined) {
+					connectionOptions.clientTlsIdentity = mTlsIdLabel;
 				} else {
-					/*
-					 * Identity credentials to be stored in the wallet
-					 * Look for signedCert in first-network-connection.json
-					 */
-					identity = await this._enrollUserIdentity(
-						signedCertPath,
-						adminPrivateKeyPath,
-						identity
+					throw new ExplorerError(
+						`Not found Identity ${mTlsIdLabel} in your wallet`
 					);
 				}
 			}
 
-			// Set connection options; identity and wallet
-			const connectionOptions = {
-				identity: this.userName,
-				mspId: this.mspId,
-				wallet: this.wallet,
-				discovery: {
-					enabled: true
-				},
-				clientTlsIdentity: this.userName,
-				eventHandlerOptions: {
-					commitTimeout: 100
-				}
-			};
-
 			// Connect to gateway
-			await this.gateway.connect(
-				this.config,
-				connectionOptions
-			);
-			this.client = this.gateway.getClient();
+			await this.gateway.connect(this.config, connectionOptions);
 		} catch (error) {
-			logger.error(` ${error}`);
+			logger.error(`${error}`);
 			throw new ExplorerError(explorer_mess.error.ERROR_1010);
 		}
 	}
 
-	getDefaultChannelName() {
-		return this.defaultChannelName;
-	}
 	getEnableAuthentication() {
 		return this.enableAuthentication;
 	}
 
-	getDefaultPeer() {
-		return this.defaultPeer;
-	}
-	getDefaultPeerUrl() {
-		return this.defaultPeerUrl;
+	getDiscoveryProtocol() {
+		return Client.getConfigSetting('discovery-protocol');
 	}
 
 	getDefaultMspId() {
-		return this.mspId;
-	}
-	async getClient() {
-		return this.gateway.getClient();
+		return this.fabricConfig.getMspId();
 	}
 
 	getTls() {
@@ -180,15 +160,17 @@ class FabricGateway {
 	 * @private method
 	 *
 	 */
-	async _enrollUserIdentity(signedCertPath, adminPrivateKeyPath, identity) {
-		const _signedCertPath = signedCertPath;
-		const _adminPrivateKeyPath = adminPrivateKeyPath;
-		const cert = fs.readFileSync(_signedCertPath, 'utf8');
-		// See in first-network-connection.json adminPrivateKey key
-		const key = fs.readFileSync(_adminPrivateKeyPath, 'utf8');
-		identity = X509WalletMixin.createIdentity(this.mspId, cert, key);
-		logger.log('this.identityLabel ', this.identityLabel);
-		await this.wallet.import(this.identityLabel, identity);
+	async enrollUserIdentity(userName, signedCertPem, adminPrivateKeyPem) {
+		const identity = {
+			credentials: {
+				certificate: signedCertPem,
+				privateKey: adminPrivateKeyPem
+			},
+			mspId: this.fabricConfig.getMspId(),
+			type: 'X.509'
+		};
+		logger.info('enrollUserIdentity: userName :', userName);
+		await this.wallet.put(userName, identity);
 		return identity;
 	}
 
@@ -196,42 +178,91 @@ class FabricGateway {
 	 * @private method
 	 *
 	 */
-	async _enrollCaIdentity(caURL, enrollment, identity) {
-		try {
-			logger.log(
-				'this.fabricCaEnabled ',
-				this.fabricCaEnabled,
-				' caURL[0] ',
-				caURL
-			);
-			if (this.fabricCaEnabled) {
-				const ca = new FabricCAServices(caURL[0]);
-				enrollment = await ca.enroll({
-					enrollmentID: this.userName,
-					enrollmentSecret: this.fabricConfig.getAdminPassword()
-				});
-				logger.log('>>>>>>>>>>>>>>>>>>>>>>>>> enrollment ', enrollment);
-				identity = X509WalletMixin.createIdentity(
-					this.mspId,
-					enrollment.certificate,
-					enrollment.key.toBytes()
-				);
-				logger.log('identity ', identity);
-				// Import identity wallet
-				await this.wallet.import(this.identityLabel, identity);
-			}
-		} catch (error) {
-			/*
-			 * TODO add explanation for message 'Calling enrollment endpoint failed with error [Error: connect ECONNREFUSED 127.0.0.1:7054]'
-			 * Reason : no fabric running, check your network
-			 */
-			logger.error('Error instantiating FabricCAServices ', error);
-			// TODO decide how to proceed if error
+	async enrollCaIdentity(id, secret) {
+		if (!this.fabricCaEnabled) {
+			logger.error('CA server is not configured');
+			return null;
 		}
-		return {
-			enrollment,
-			identity
-		};
+
+		try {
+			const caConfig = this.fabricConfig.getCertificateAuthorities();
+			const tlsCACert = fs.readFileSync(caConfig.serverCertPath, 'utf8');
+
+			const ca = new FabricCAServices(caConfig.caURL[0], {
+				trustedRoots: tlsCACert,
+				verify: false
+			});
+
+			const enrollment = await ca.enroll({
+				enrollmentID: this.fabricConfig.getCaAdminUser(),
+				enrollmentSecret: this.fabricConfig.getCaAdminPassword()
+			});
+
+			logger.info('>>>>>>>>>>>>>>>>>>>>>>>>> enrollment : ca admin');
+
+			const identity = {
+				credentials: {
+					certificate: enrollment.certificate,
+					privateKey: enrollment.key.toBytes()
+				},
+				mspId: this.fabricConfig.getMspId(),
+				type: 'X.509'
+			};
+
+			// Import identity wallet
+			await this.wallet.put(this.fabricConfig.getCaAdminUser(), identity);
+
+			const adminUser = await this.getUserContext(
+				this.fabricConfig.getCaAdminUser()
+			);
+			await ca.register(
+				{
+					affiliation: this.fabricConfig.getAdminAffiliation(),
+					enrollmentID: id,
+					enrollmentSecret: secret,
+					role: 'admin'
+				},
+				adminUser
+			);
+
+			const enrollmentBEAdmin = await ca.enroll({
+				enrollmentID: id,
+				enrollmentSecret: secret
+			});
+
+			logger.info(
+				'>>>>>>>>>>>>>>>>>>>>>>>>> registration & enrollment : BE admin'
+			);
+
+			const identityBEAdmin = {
+				credentials: {
+					certificate: enrollmentBEAdmin.certificate,
+					privateKey: enrollmentBEAdmin.key.toBytes()
+				},
+				mspId: this.fabricConfig.getMspId(),
+				type: 'X.509'
+			};
+			await this.wallet.put(id, identityBEAdmin);
+
+			logger.debug('Successfully get user enrolled and imported to wallet, ', id);
+
+			return identityBEAdmin;
+		} catch (error) {
+			// TODO decide how to proceed if error
+			logger.error('Error instantiating FabricCAServices ', error);
+			return null;
+		}
+	}
+
+	async getUserContext(user) {
+		const identity = await this.wallet.get(user);
+		if (!identity) {
+			logger.error('Not exist user :', user);
+			return null;
+		}
+		const provider = this.wallet.getProviderRegistry().getProvider(identity.type);
+		const userContext = await provider.getUserContext(identity, user);
+		return userContext;
 	}
 
 	async getIdentityInfo(label) {
@@ -246,6 +277,138 @@ class FabricGateway {
 			logger.error(error);
 		}
 		return identityInfo;
+	}
+
+	async queryChannels() {
+		const network = await this.gateway.getNetwork(this.defaultChannelName);
+
+		// Get the contract from the network.
+		const contract = network.getContract('cscc');
+		const result = await contract.evaluateTransaction('GetChannels');
+		const resultJson = fabprotos.protos.ChannelQueryResponse.decode(result);
+		logger.debug('queryChannels', resultJson);
+		return resultJson;
+	}
+
+	async queryBlock(channelName, blockNum) {
+		try {
+			const network = await this.gateway.getNetwork(this.defaultChannelName);
+
+			// Get the contract from the network.
+			const contract = network.getContract('qscc');
+			const resultByte = await contract.evaluateTransaction(
+				'GetBlockByNumber',
+				channelName,
+				String(blockNum)
+			);
+			const resultJson = BlockDecoder.decode(resultByte);
+			logger.debug('queryBlock', resultJson);
+			return resultJson;
+		} catch (error) {
+			logger.error(
+				`Failed to get block ${blockNum} from channel ${channelName} : `,
+				error
+			);
+			return null;
+		}
+	}
+
+	async queryInstantiatedChaincodes(channelName) {
+		logger.info('queryInstantiatedChaincodes', channelName);
+		const network = await this.gateway.getNetwork(this.defaultChannelName);
+		let contract = network.getContract('lscc');
+		let result = await contract.evaluateTransaction('GetChaincodes');
+		let resultJson = fabprotos.protos.ChaincodeQueryResponse.decode(result);
+		if (resultJson.chaincodes.length <= 0) {
+			resultJson = { chaincodes: [] };
+			contract = network.getContract('_lifecycle');
+			result = await contract.evaluateTransaction('QueryInstalledChaincodes', '');
+			const decodedReult = fabprotos.lifecycle.QueryInstalledChaincodesResult.decode(
+				result
+			);
+			for (const cc of decodedReult.installed_chaincodes) {
+				logger.info('1:', cc);
+				const ccInfo = cc.references[channelName];
+				if (ccInfo !== undefined) {
+					logger.info('2:', ccInfo);
+					resultJson.chaincodes = concat(resultJson.chaincodes, ccInfo.chaincodes);
+				}
+			}
+		}
+		logger.debug('queryInstantiatedChaincodes', resultJson);
+		return resultJson;
+	}
+
+	async queryChainInfo(channelName) {
+		try {
+			const network = await this.gateway.getNetwork(this.defaultChannelName);
+
+			// Get the contract from the network.
+			const contract = network.getContract('qscc');
+			const resultByte = await contract.evaluateTransaction(
+				'GetChainInfo',
+				channelName
+			);
+			const resultJson = fabprotos.common.BlockchainInfo.decode(resultByte);
+			logger.debug('queryChainInfo', resultJson);
+			return resultJson;
+		} catch (error) {
+			logger.error(
+				`Failed to get chain info from channel ${channelName} : `,
+				error
+			);
+			return null;
+		}
+	}
+
+	async getDiscoveryResult(channelName) {
+		try {
+			const network = await this.gateway.getNetwork(channelName);
+			const channel = network.getChannel();
+			const ds = new DiscoveryService('be discovery service', channel);
+
+			const client = new Client('discovery client');
+			client.setTlsClientCertAndKey();
+
+			const mspID = this.config.client.organization;
+			const targets = [];
+			for (const peer of this.config.organizations[mspID].peers) {
+				const discoverer = new Discoverer(`be discoverer ${peer}`, client);
+				const url = this.config.peers[peer].url;
+				const pem = this.fabricConfig.getPeerTlsCACertsPem(peer);
+				let grpcOpt = {};
+				if ('grpcOptions' in this.config.peers[peer]) {
+					grpcOpt = this.config.peers[peer].grpcOptions;
+				}
+				const peer_endpoint = client.newEndpoint(
+					Object.assign(grpcOpt, {
+						url: url,
+						pem: pem
+					})
+				);
+				await discoverer.connect(peer_endpoint);
+				targets.push(discoverer);
+			}
+
+			const idx = this.gateway.identityContext;
+			// do the three steps
+			ds.build(idx);
+			ds.sign(idx);
+			await ds.send({
+				asLocalhost: this.asLocalhost,
+				refreshAge: 15000,
+				targets: targets
+			});
+
+			const result = await ds.getDiscoveryResults(true);
+			return result;
+		} catch (error) {
+			logger.error(
+				`Failed to get discovery result from channel ${channelName} : `,
+				error
+			);
+		}
+		return null;
 	}
 }
 

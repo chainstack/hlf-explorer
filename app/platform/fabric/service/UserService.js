@@ -3,11 +3,12 @@
  */
 /* eslint-disable */
 
+const fs = require('fs');
+
 const User = require('../models/User');
 const helper = require('../../../common/helper');
 const logger = helper.getLogger('UserService');
 
-const { X509WalletMixin } = require('fabric-network');
 const FabricCAServices = require('fabric-ca-client');
 
 /**
@@ -44,21 +45,40 @@ class UserService {
 		let adminUser = null;
 		let adminPassword = null;
 		if (user.user && user.password && user.network) {
-			logger.log('user.network ', user.network);
-			const network = this.platform.getNetworks().get(user.network);
+			logger.info('user.network ', user.network);
+			const clientObj = this.platform.getNetworks().get(user.network);
 
-			// TODO, need review maybe there is a better way to get the client config enableAuthentication
-			for (const [network_name, clients] of network.entries()) {
-				if (clients.config && clients.config.client) {
-					enableAuth = clients.config.client.enableAuthentication;
-					if (typeof enableAuth !== 'undefined' && enableAuth !== null) {
-						logger.info(
-							`Network: ${network_name} enableAuthentication ${enableAuth}`
-						);
-						adminUser = clients.config.client.adminUser;
-						adminPassword = clients.config.client.adminPassword;
-						break;
-					}
+			if (!clientObj) {
+				const errMsg = `Faied to get client object for ${user.network}`;
+				logger.error(errMsg);
+				return {
+					authenticated: false,
+					user: user.user,
+					message: `Internal error: ${errMsg}`,
+					enableAuthentication: enableAuth,
+					network: user.network
+				};
+			}
+
+			let client = clientObj.instance;
+			const fabricConfig = client.fabricGateway.fabricConfig;
+			enableAuth = fabricConfig.getEnableAuthentication();
+			if (enableAuth) {
+				logger.info(`Network: ${user.network} enableAuthentication ${enableAuth}`);
+				adminUser = fabricConfig.getAdminUser();
+				adminPassword = fabricConfig.getAdminPassword();
+
+				// Not authorized if credentials are incomplete in auth enabled mode
+				if (!adminUser || !adminPassword) {
+					const errMsg = `Faied authentication for ${user.network}`;
+					logger.error(errMsg);
+					return {
+						authenticated: false,
+						user: user.user,
+						message: `Internal error: ${errMsg}`,
+						enableAuthentication: enableAuth,
+						network: user.network
+					};
 				}
 			}
 
@@ -67,7 +87,8 @@ class UserService {
 				return {
 					authenticated: true,
 					user: user.user,
-					enableAuthentication: enableAuth
+					enableAuthentication: enableAuth,
+					network: user.network
 				};
 			}
 
@@ -76,22 +97,25 @@ class UserService {
 				return {
 					authenticated: true,
 					user: user.user,
-					enableAuthentication: enableAuth
+					enableAuthentication: enableAuth,
+					network: user.network
 				};
 			} else {
 				return {
 					authenticated: false,
 					user: user.user,
 					message: 'Invalid user name, or password',
-					enableAuthentication: enableAuth
+					enableAuthentication: enableAuth,
+					network: user.network
 				};
 			}
 		} else {
 			return {
 				authenticated: false,
-				message: 'Invalid request, found ',
 				user: user.user,
-				enableAuthentication: enableAuth
+				message: 'Invalid request',
+				enableAuthentication: enableAuth,
+				network: user.network
 			};
 		}
 	}
@@ -109,38 +133,36 @@ class UserService {
     2. register user if doesn't exist
     3. depending on the user type use either enrollUserIdentity, or  enrollCaIdentity*/
 		try {
-			var username = user['user'];
 			var fabricClient = this.platform.getClient();
 			var fabricGw = fabricClient.fabricGateway;
 			var userOrg = fabricClient.config.client.organization;
-			var isExist = await fabricGw.wallet.exists(username);
+			var isExist = await fabricGw.wallet.get(user['user']);
 
 			if (isExist) {
 				throw new Error('already exists');
 			} else {
 				if (fabricGw.fabricCaEnabled) {
-					var caURL;
-					var serverCertPath;
-					({
-						caURL,
-						serverCertPath
-					} = fabricGw.fabricConfig.getCertificateAuthorities());
-					let ca = new FabricCAServices(caURL[0]);
-
-					let adminUserObj = await fabricClient.hfc_client.setUserContext({
-						username: fabricGw.fabricConfig.getAdminUser(),
-						password: fabricGw.fabricConfig.getAdminPassword()
+					const caConfig = fabricGw.fabricConfig.getCertificateAuthorities();
+					const tlsCACert = fs.readFileSync(caConfig.serverCertPath, 'utf8');
+					const ca = new FabricCAServices(caConfig.caURL[0], {
+						trustedRoots: tlsCACert,
+						verify: false
 					});
+
+					const adminUserName = fabricGw.fabricConfig.getAdminUser();
+					const adminUserObj = await fabricGw.getUserContext(adminUserName);
+
 					let secret = await ca.register(
 						{
-							enrollmentID: username,
+							enrollmentID: user['user'],
 							enrollmentSecret: user['password'],
 							affiliation: [userOrg.toLowerCase(), user['affiliation']].join('.'),
 							role: user['roles']
 						},
 						adminUserObj
 					);
-					logger.debug('Successfully got the secret for user %s', username);
+
+					logger.debug('Successfully got the secret for user %s', user['user']);
 				} else {
 					throw new Error('did not register with CA');
 				}
@@ -203,37 +225,12 @@ class UserService {
 		var username = user['user'];
 		var fabricClient = this.platform.getClient();
 		var fabricGw = fabricClient.fabricGateway;
-		var isExist = await fabricGw.wallet.exists(username);
-		if (isExist) {
-			// Throw new Error('Failed to enroll: Not found identity in wallet, ' + err.toString());
-			const identity = await fabricGw.wallet.export(username);
-			// Await reconnectGw(user, identity);
+		var identity = await fabricGw.wallet.get(username);
+		if (identity) {
 			return identity;
 		} else {
 			try {
-				var caURL;
-				var serverCertPath;
-				({
-					caURL,
-					serverCertPath
-				} = fabricGw.fabricConfig.getCertificateAuthorities());
-				let ca = new FabricCAServices(caURL[0]);
-				const enrollment = await ca.enroll({
-					enrollmentID: username,
-					enrollmentSecret: user['password']
-				});
-
-				// Import identity wallet
-				var identity = X509WalletMixin.createIdentity(
-					fabricGw.mspId,
-					enrollment.certificate,
-					enrollment.key.toBytes()
-				);
-				await fabricGw.wallet.import(username, identity);
-				logger.debug(
-					'Successfully get user enrolled and imported to wallet, ',
-					username
-				);
+				identity = await fabricGw.enrollCaIdentity(user['user'], user['password']);
 				return identity;
 			} catch (err) {
 				logger.error('Failed to enroll %s', username);
@@ -276,10 +273,7 @@ class UserService {
 			fabricGw.gateway.disconnect();
 
 			// Connect to gateway
-			await fabricGw.gateway.connect(
-				fabricGw.config,
-				connectionOptions
-			);
+			await fabricGw.gateway.connect(fabricGw.config, connectionOptions);
 			logger.debug('Successfully reconnected with ', username);
 		} catch (err) {
 			throw new Error('Failed to reconnect: ' + err.toString());

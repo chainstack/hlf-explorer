@@ -26,7 +26,7 @@
     $pkill node
     Before killing the node , check that same port is running `“ps -ef | grep node”` if yes kill the particular port “ kill -9 ‘number’” . if no change the port in config.json
 
-#### Related Information:
+##### Related Information:
 
 #### Problem Description: Hypeledger Explorer fails to start, ENOENT: no such file or directory, scandir
 
@@ -741,7 +741,6 @@ adminPrivateKeyPath  /Users/USER_ID/workspace/fabric-1.3/fabric-samples/balance-
     organizations:
     { Org1MSP:
         { mspid: 'Org1MSP',
-            fullpath: true,
             adminPrivateKey: [Object],
             signedCert: [Object] } },
     peers:
@@ -901,7 +900,6 @@ adminPrivateKeyPath  /Users/USER_ID/workspace/fabric-1.3/fabric-samples/balance-
     organizations:
     { Org1MSP:
         { mspid: 'Org1MSP',
-            fullpath: true,
             adminPrivateKey: [Object],
             signedCert: [Object] } },
     peers:
@@ -1079,10 +1077,26 @@ to
 
 ``` host all all 127.0.0.1/32 md5 ```
 
-
-
-#### Related Information:
+##### Related Information:
  Full error info at https://pastebin.com/fyNSp66K
+
+#### Problem Description: Hypeledger Explorer fails to start, not assigned to this channel
+
+##### Background Information:
+
+```bash
+error: [Channel.js]: Error: Peer with name "peer0.example.com" not assigned to this channel
+error: [Remote.js]: Error: Failed to connect before the deadline URL:grpcs://peer0.example.com:7051
+```
+
+##### Possible cause:
+
+    Invalid peer name in "channels.<channel name>.peers.<peer name>" or "peers.<peer name>" defined in connection.json file.
+
+##### Possible solution:
+    Fix and match to the valid peer name in this channels or peers in connection.json
+
+##### Related Information:
 
 ### Docker Troubleshooting commands
 
