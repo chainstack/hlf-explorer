@@ -3,7 +3,10 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 const helper = require('../../common/helper');
+const explorer_mess = require('../../common/ExplorerMessage').explorer;
+const ExplorerError = require('../../common/ExplorerError');
 
 const logger = helper.getLogger('FabricConfig');
 
@@ -51,10 +54,32 @@ class FabricConfig {
 	 * @memberof FabricConfig
 	 */
 	isFabricCaEnabled() {
-		if (this.config.certificateAuthorities) {
-			return true;
+		if (this.config.certificateAuthorities === undefined) {
+			return false;
 		}
-		return false;
+
+		const org = this.getOrganization();
+		const caArray = this.config.organizations[org].certificateAuthorities;
+		if (caArray === undefined) {
+			return false;
+		}
+
+		const caName = caArray[0];
+		if (this.config.certificateAuthorities[caName] === undefined) {
+			return false;
+		}
+		logger.info('Fabric CA: Enabled');
+		return true;
+	}
+
+	/**
+	 *
+	 *
+	 * @returns
+	 * @memberof FabricConfig
+	 */
+	getOrganization() {
+		return this.config.client.organization;
 	}
 
 	/**
@@ -85,7 +110,47 @@ class FabricConfig {
 	 * @memberof FabricConfig
 	 */
 	getAdminUser() {
-		return this.config.client.adminUser;
+		return this.config.client.adminCredential.id;
+	}
+
+	/**
+	 *
+	 *
+	 * @returns
+	 * @memberof FabricConfig
+	 */
+	getAdminPassword() {
+		return this.config.client.adminCredential.password;
+	}
+
+	/**
+	 *
+	 *
+	 * @returns
+	 * @memberof FabricConfig
+	 */
+	getAdminAffiliation() {
+		return this.config.client.adminCredential.affiliation;
+	}
+
+	/**
+	 *
+	 *
+	 * @returns
+	 * @memberof FabricConfig
+	 */
+	getCaAdminUser() {
+		return this.config.client.caCredential.id;
+	}
+
+	/**
+	 *
+	 *
+	 * @returns
+	 * @memberof FabricConfig
+	 */
+	getCaAdminPassword() {
+		return this.config.client.caCredential.password;
 	}
 
 	/**
@@ -104,16 +169,6 @@ class FabricConfig {
 	 * @returns
 	 * @memberof FabricConfig
 	 */
-	getAdminPassword() {
-		return this.config.client.adminPassword;
-	}
-
-	/**
-	 *
-	 *
-	 * @returns
-	 * @memberof FabricConfig
-	 */
 	getDefaultChannel() {
 		let defChannel;
 		for (const x in this.config.channels) {
@@ -124,21 +179,6 @@ class FabricConfig {
 			}
 		}
 		return defChannel;
-	}
-
-	/**
-	 *
-	 *
-	 * @returns
-	 * @memberof FabricConfig
-	 */
-	getDefaultPeerConfig() {
-		let defaultPeerConfig = [];
-		const peers = this.getPeersConfig();
-		if (peers) {
-			defaultPeerConfig = peers[0];
-		}
-		return defaultPeerConfig;
 	}
 
 	/**
@@ -171,22 +211,24 @@ class FabricConfig {
 	 * @returns
 	 * @memberof FabricConfig
 	 */
-	getOrganizationsConfig() {
-		const orgMsp = [];
-		let adminPrivateKeyPath;
-		let signedCertPath;
-		for (const x in this.config.organizations) {
-			if (this.config.organizations[x].mspid) {
-				orgMsp.push(this.config.organizations[x].mspid);
-			}
-			if (this.config.organizations[x].adminPrivateKey) {
-				adminPrivateKeyPath = this.config.organizations[x].adminPrivateKey.path;
-			}
-			if (this.config.organizations[x].signedCert) {
-				signedCertPath = this.config.organizations[x].signedCert.path;
-			}
+	getOrgSignedCertPem() {
+		const organization = this.config.organizations[this.getOrganization()];
+		if (
+			organization.signedCert === undefined ||
+			(organization.signedCert.path === undefined &&
+				organization.signedCert.pem === undefined)
+		) {
+			logger.error('Not found signedCert configuration');
+			throw new ExplorerError(explorer_mess.error.ERROR_2015);
 		}
-		return { orgMsp, adminPrivateKeyPath, signedCertPath };
+
+		if (organization.signedCert.path !== undefined) {
+			return fs.readFileSync(
+				path.resolve(__dirname, '../../..', organization.signedCert.path),
+				'utf8'
+			);
+		}
+		return organization.signedCert.pem;
 	}
 
 	/**
@@ -195,17 +237,60 @@ class FabricConfig {
 	 * @returns
 	 * @memberof FabricConfig
 	 */
-	getServerCertPath() {
-		let serverCertPath = null;
-		if (this.config.certificateAuthorities) {
-			for (const x in this.config.certificateAuthorities) {
-				if (this.config.certificateAuthorities[x].tlsCACerts) {
-					serverCertPath = this.config.certificateAuthorities[x].tlsCACerts.path;
-				}
-			}
+	getOrgAdminPrivateKeyPem() {
+		const organization = this.config.organizations[this.getOrganization()];
+		if (
+			organization.adminPrivateKey === undefined ||
+			(organization.adminPrivateKey.path === undefined &&
+				organization.adminPrivateKey.pem === undefined)
+		) {
+			logger.error('Not found adminPrivateKey configuration');
+			throw new ExplorerError(explorer_mess.error.ERROR_2015);
 		}
 
-		return serverCertPath;
+		if (organization.adminPrivateKey.path !== undefined) {
+			return fs.readFileSync(
+				path.resolve(__dirname, '../../..', organization.adminPrivateKey.path),
+				'utf8'
+			);
+		}
+		return organization.adminPrivateKey.pem;
+	}
+
+	/**
+	 *
+	 *
+	 * @returns
+	 * @memberof FabricConfig
+	 */
+	getPeerTlsCACertsPem(peer) {
+		const tlsCACerts = this.config.peers[peer].tlsCACerts;
+		if (
+			tlsCACerts === undefined ||
+			(tlsCACerts.path === undefined && tlsCACerts.pem === undefined)
+		) {
+			logger.error(`Not found tlsCACerts configuration: ${peer.url}`);
+			return '';
+		}
+
+		if (tlsCACerts.path !== undefined) {
+			return fs.readFileSync(
+				path.resolve(__dirname, '../../..', tlsCACerts.path),
+				'utf8'
+			);
+		}
+		return tlsCACerts.pem;
+	}
+
+	/**
+	 *
+	 *
+	 * @returns
+	 * @memberof FabricConfig
+	 */
+	getMspId() {
+		const organization = this.config.organizations[this.getOrganization()];
+		return organization.mspid;
 	}
 
 	/**

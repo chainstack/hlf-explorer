@@ -86,25 +86,24 @@ class SyncPlatform {
 			this.client_name
 		);
 
-		// Setting the block synch interval time
-		await this.setBlocksSyncTime(all_config);
-
 		logger.debug('Blocks synch interval time >> %s', this.blocksSyncTime);
+
 		// Update the discovery-cache-life as block synch interval time in global config
 		global.hfc.config.set('discovery-cache-life', this.blocksSyncTime);
-		global.hfc.config.set('initialize-with-discovery', true);
+		// global.hfc.config.set('initialize-with-discovery', true);
 
-		const client_configs = network_configs[this.network_name];
-
-		this.client_configs = await FabricUtils.setOrgEnrolmentPath(client_configs);
+		this.client_configs = network_configs[this.network_name];
 
 		this.client = await FabricUtils.createFabricClient(
 			this.client_configs,
+			this.network_name,
 			this.client_name
 		);
 		if (!this.client) {
 			throw new ExplorerError(explorer_mess.error.ERROR_2011);
 		}
+
+		this.client.network_name = this.network_name;
 
 		// Updating the client network and other details to DB
 		const res = await this.syncService.synchNetworkConfigToDB(this.client);
@@ -140,11 +139,11 @@ class SyncPlatform {
 	 * @memberof SyncPlatform
 	 */
 	async isChannelEventHubConnected() {
-		for (const [channel_name, channel] of this.client.getChannels().entries()) {
+		for (const channel_name of this.client.getChannels()) {
 			// Validate channel event is connected
 			const status = this.eventHub.isChannelEventHubConnected(channel_name);
 			if (status) {
-				await this.syncService.synchBlocks(this.client, channel);
+				await this.syncService.synchBlocks(this.client, channel_name);
 			} else {
 				// Channel client is not connected then it will reconnect
 				this.eventHub.connectChannelEventHub(channel_name);
@@ -153,11 +152,8 @@ class SyncPlatform {
 	}
 
 	setBlocksSyncTime(blocksSyncTime) {
-		if (blocksSyncTime) {
-			const time = parseInt(blocksSyncTime, 10);
-			if (!isNaN(time)) {
-				this.blocksSyncTime = time * 60 * 1000;
-			}
+		if (!isNaN(blocksSyncTime)) {
+			this.blocksSyncTime = blocksSyncTime * 1000;
 		}
 	}
 
